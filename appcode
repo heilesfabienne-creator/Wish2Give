@@ -1,0 +1,1112 @@
+import React, { useEffect, useMemo, useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Badge } from "@/components/ui/badge";
+import {
+  Heart,
+  HeartOff,
+  Link as LinkIcon,
+  Plus,
+  Copy,
+  Trash2,
+  Gift,
+  ListChecks,
+  MapPin,
+} from "lucide-react";
+
+/**
+ * Wish2Give MVP (single-file)
+ * - Creator: create wishlists, optionally add delivery info (global or per-wishlist), add items via link + details.
+ * - Gifter: browse wishlist, filter by price, sort, favorite, purchase via original link, copy address.
+ *
+ * Notes:
+ * - Purchases always happen on the brand’s website. Wish2Give does not sell products.
+ * - This MVP does not auto-scrape product metadata due to browser/CORS limitations.
+ */
+
+const STORAGE_KEY = "wish2give_mvp_v1";
+
+function uid(prefix = "id") {
+  return `${prefix}_${Math.random().toString(16).slice(2)}_${Date.now().toString(16)}`;
+}
+
+function currency(n) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "";
+  try {
+    return new Intl.NumberFormat(undefined, { style: "currency", currency: "EUR" }).format(n);
+  } catch {
+    return `€${Number(n).toFixed(2)}`;
+  }
+}
+
+function clampMoney(v) {
+  if (v === "") return "";
+  const n = Number(v);
+  if (Number.isNaN(n)) return "";
+  return Math.max(0, Math.round(n * 100) / 100);
+}
+
+function formatAddress(a) {
+  if (!a) return "";
+  const lines = [
+    a.fullName,
+    a.street,
+    [a.postalCode, a.city].filter(Boolean).join(" "),
+    a.country,
+    a.phone ? `Phone: ${a.phone}` : "",
+  ].filter(Boolean);
+  return lines.join("\n");
+}
+
+function safeHost(url) {
+  try {
+    const u = new URL(url);
+    return u.host;
+  } catch {
+    return "";
+  }
+}
+
+function isValidUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+const emptyState = {
+  wishlists: [],
+  globalAddressEnabled: false,
+  globalAddressConsent: false,
+  globalAddress: {
+    fullName: "",
+    street: "",
+    city: "",
+    postalCode: "",
+    country: "",
+    phone: "",
+  },
+  favorites: {}, // itemId -> true
+};
+
+export default function Wish2GiveApp() {
+  const [mode, setMode] = useState("create"); // create | gift
+  const [data, setData] = useState(emptyState);
+
+  // Creator inputs
+  const [newListName, setNewListName] = useState("");
+  const [newListTheme, setNewListTheme] = useState("");
+  const [pendingCreate, setPendingCreate] = useState(false);
+
+  const [activeListId, setActiveListId] = useState(null);
+
+  // Add item inputs
+  const [itemLink, setItemLink] = useState("");
+  const [itemTitle, setItemTitle] = useState("");
+  const [itemDesc, setItemDesc] = useState("");
+  const [itemPrice, setItemPrice] = useState("");
+  const [itemImage, setItemImage] = useState("");
+
+  // Gifter filters
+  const [selectedListId, setSelectedListId] = useState("all");
+  const [priceMin, setPriceMin] = useState("");
+  const [priceMax, setPriceMax] = useState("");
+  const [sort, setSort] = useState("none"); // none | low
+
+  // Load / save
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        setData({ ...emptyState, ...parsed });
+        // Default active list
+        if (parsed?.wishlists?.length) setActiveListId(parsed.wishlists[0].id);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    } catch {
+      // ignore
+    }
+  }, [data]);
+
+  const wishlists = data.wishlists || [];
+  const activeList = wishlists.find((w) => w.id === activeListId) || null;
+
+  // Set defaults if lists change
+  useEffect(() => {
+    if (!activeListId && wishlists.length) setActiveListId(wishlists[0].id);
+  }, [wishlists.length]);
+
+  const allItems = useMemo(() => {
+    const items = [];
+    for (const w of wishlists) {
+      for (const it of w.items || []) items.push({ ...it, wishlistId: w.id, wishlistName: w.name, wishlistTheme: w.theme });
+    }
+    return items;
+  }, [wishlists]);
+
+  const filteredItems = useMemo(() => {
+    let items = allItems;
+    if (selectedListId !== "all") items = items.filter((i) => i.wishlistId === selectedListId);
+    const min = priceMin === "" ? null : Number(priceMin);
+    const max = priceMax === "" ? null : Number(priceMax);
+    if (min !== null && !Number.isNaN(min)) items = items.filter((i) => (i.price ?? 0) >= min);
+    if (max !== null && !Number.isNaN(max)) items = items.filter((i) => (i.price ?? 0) <= max);
+
+    if (sort === "low") items = [...items].sort((a, b) => (a.price ?? Number.POSITIVE_INFINITY) - (b.price ?? Number.POSITIVE_INFINITY));
+    return items;
+  }, [allItems, selectedListId, priceMin, priceMax, sort]);
+
+  function createWishlist() {
+    const name = newListName.trim();
+    if (!name) return;
+    const theme = newListTheme.trim();
+    const w = {
+      id: uid("wl"),
+      name,
+      theme,
+      createdAt: new Date().toISOString(),
+      addressEnabled: false,
+      addressConsent: false,
+      address: {
+        fullName: "",
+        street: "",
+        city: "",
+        postalCode: "",
+        country: "",
+        phone: "",
+      },
+      items: [],
+    };
+    setData((d) => ({ ...d, wishlists: [w, ...(d.wishlists || [])] }));
+    setNewListName("");
+    setNewListTheme("");
+    setPendingCreate(false);
+    setActiveListId(w.id);
+  }
+
+  function deleteWishlist(id) {
+    setData((d) => ({
+      ...d,
+      wishlists: (d.wishlists || []).filter((w) => w.id !== id),
+    }));
+    setActiveListId((prev) => {
+      if (prev !== id) return prev;
+      const remaining = wishlists.filter((w) => w.id !== id);
+      return remaining[0]?.id ?? null;
+    });
+  }
+
+  function addItem() {
+    if (!activeList) return;
+    const link = itemLink.trim();
+    if (!isValidUrl(link)) return;
+    const title = itemTitle.trim() || "(Untitled item)";
+    const desc = itemDesc.trim();
+    const image = itemImage.trim();
+    const price = itemPrice === "" ? null : clampMoney(itemPrice);
+
+    const it = {
+      id: uid("it"),
+      link,
+      title,
+      description: desc,
+      price: price === "" ? null : price,
+      image,
+      createdAt: new Date().toISOString(),
+    };
+
+    setData((d) => ({
+      ...d,
+      wishlists: (d.wishlists || []).map((w) =>
+        w.id === activeList.id ? { ...w, items: [it, ...(w.items || [])] } : w
+      ),
+    }));
+
+    setItemLink("");
+    setItemTitle("");
+    setItemDesc("");
+    setItemPrice("");
+    setItemImage("");
+  }
+
+  function deleteItem(wishlistId, itemId) {
+    setData((d) => ({
+      ...d,
+      wishlists: (d.wishlists || []).map((w) =>
+        w.id === wishlistId ? { ...w, items: (w.items || []).filter((it) => it.id !== itemId) } : w
+      ),
+    }));
+    setData((d) => {
+      const favs = { ...(d.favorites || {}) };
+      delete favs[itemId];
+      return { ...d, favorites: favs };
+    });
+  }
+
+  function toggleFavorite(itemId) {
+    setData((d) => {
+      const favs = { ...(d.favorites || {}) };
+      if (favs[itemId]) delete favs[itemId];
+      else favs[itemId] = true;
+      return { ...d, favorites: favs };
+    });
+  }
+
+  async function copyToClipboard(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // fallback
+      const el = document.createElement("textarea");
+      el.value = text;
+      document.body.appendChild(el);
+      el.select();
+      document.execCommand("copy");
+      document.body.removeChild(el);
+    }
+  }
+
+  function updateGlobalAddress(patch) {
+    setData((d) => ({ ...d, globalAddress: { ...d.globalAddress, ...patch } }));
+  }
+
+  function updateWishlistAddress(wishlistId, patch) {
+    setData((d) => ({
+      ...d,
+      wishlists: (d.wishlists || []).map((w) =>
+        w.id === wishlistId ? { ...w, address: { ...w.address, ...patch } } : w
+      ),
+    }));
+  }
+
+  function setWishlistFlag(wishlistId, patch) {
+    setData((d) => ({
+      ...d,
+      wishlists: (d.wishlists || []).map((w) => (w.id === wishlistId ? { ...w, ...patch } : w)),
+    }));
+  }
+
+  const creatorHint = (
+    <div className="text-sm text-muted-foreground leading-relaxed">
+      <div className="flex items-center gap-2">
+        <Gift className="h-4 w-4" />
+        <span>
+          Add items by pasting a shop link 🔗 and filling in a few details.
+          <span className="ml-1 font-medium">Purchases always happen on the brand’s website</span> —
+          Wish2Give doesn’t sell products.
+        </span>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-zinc-50 to-white">
+      <div className="mx-auto max-w-6xl p-4 md:p-8">
+        <header className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+          <div>
+            <div className="flex items-center gap-2">
+              <div className="h-10 w-10 rounded-2xl bg-zinc-900 text-white grid place-items-center shadow-sm">
+                <Gift className="h-5 w-5" />
+              </div>
+              <h1 className="text-2xl md:text-3xl font-semibold tracking-tight">Wish2Give</h1>
+            </div>
+            <p className="text-muted-foreground mt-1">Create and share wishlists so people can gift exactly what you want 🎁</p>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <Button
+              variant={mode === "create" ? "default" : "outline"}
+              className="rounded-2xl"
+              onClick={() => setMode("create")}
+            >
+              Create a wishlist
+            </Button>
+            <Button
+              variant={mode === "gift" ? "default" : "outline"}
+              className="rounded-2xl"
+              onClick={() => setMode("gift")}
+            >
+              Find a gift
+            </Button>
+          </div>
+        </header>
+
+        <div className="mt-6 grid grid-cols-1 lg:grid-cols-12 gap-4">
+          {/* Sidebar */}
+          <div className="lg:col-span-4">
+            <Card className="rounded-2xl shadow-sm">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <ListChecks className="h-5 w-5" /> Wishlists
+                </CardTitle>
+                <CardDescription>
+                  {wishlists.length ? "Select a wishlist to manage or browse." : "No wishlists yet — create one to get started."}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {mode === "create" && (
+                  <div className="space-y-3">
+                    {!pendingCreate ? (
+                      <Button className="w-full rounded-2xl" onClick={() => setPendingCreate(true)}>
+                        <Plus className="h-4 w-4 mr-2" /> New wishlist
+                      </Button>
+                    ) : (
+                      <div className="space-y-3 rounded-2xl border p-3">
+                        <div className="space-y-2">
+                          <Label htmlFor="wlname">Wishlist name</Label>
+                          <Input
+                            id="wlname"
+                            value={newListName}
+                            onChange={(e) => setNewListName(e.target.value)}
+                            placeholder="e.g., Birthday wishlist"
+                            className="rounded-2xl"
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="wltheme">Occasion / theme (optional)</Label>
+                          <Input
+                            id="wltheme"
+                            value={newListTheme}
+                            onChange={(e) => setNewListTheme(e.target.value)}
+                            placeholder="e.g., Cozy home, Tech, Books"
+                            className="rounded-2xl"
+                          />
+                        </div>
+                        <div className="flex gap-2">
+                          <Button className="flex-1 rounded-2xl" onClick={createWishlist}>
+                            Create
+                          </Button>
+                          <Button variant="outline" className="rounded-2xl" onClick={() => setPendingCreate(false)}>
+                            Cancel
+                          </Button>
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          You’ll be able to add items after creating.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="space-y-2">
+                  {wishlists.map((w) => (
+                    <button
+                      key={w.id}
+                      onClick={() => {
+                        setActiveListId(w.id);
+                        setSelectedListId(w.id);
+                      }}
+                      className={`w-full text-left rounded-2xl border p-3 transition shadow-sm hover:shadow ${
+                        (mode === "create" ? activeListId : selectedListId) === w.id
+                          ? "border-zinc-900 bg-zinc-50"
+                          : "bg-white"
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <div className="font-medium leading-tight">{w.name}</div>
+                          <div className="text-xs text-muted-foreground mt-0.5">
+                            {w.theme ? (
+                              <span className="inline-flex items-center gap-1">
+                                <Badge variant="secondary" className="rounded-xl">{w.theme}</Badge>
+                              </span>
+                            ) : (
+                              <span>No theme</span>
+                            )}
+                          </div>
+                        </div>
+                        <div className="text-xs text-muted-foreground">{(w.items || []).length} items</div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+
+                {wishlists.length > 0 && (
+                  <div className="pt-2">
+                    <Button
+                      variant="outline"
+                      className="w-full rounded-2xl"
+                      onClick={() => {
+                        localStorage.removeItem(STORAGE_KEY);
+                        setData(emptyState);
+                        setActiveListId(null);
+                        setSelectedListId("all");
+                      }}
+                    >
+                      Reset demo data
+                    </Button>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            <Card className="rounded-2xl shadow-sm mt-4">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <MapPin className="h-5 w-5" /> Delivery info
+                </CardTitle>
+                <CardDescription>
+                  Optional. If added, viewers can copy it to ship gifts to you. Wish2Give is copy-only.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="flex items-center justify-between gap-3 rounded-2xl border p-3">
+                  <div>
+                    <div className="font-medium">Use a global address</div>
+                    <div className="text-xs text-muted-foreground">Applies to all wishlists (unless you set per-wishlist).</div>
+                  </div>
+                  <Switch
+                    checked={!!data.globalAddressEnabled}
+                    onCheckedChange={(v) => setData((d) => ({ ...d, globalAddressEnabled: !!v }))}
+                  />
+                </div>
+
+                {data.globalAddressEnabled && (
+                  <div className="space-y-3 rounded-2xl border p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="font-medium">Consent</div>
+                        <p className="text-xs text-muted-foreground">
+                          By adding delivery details, you agree to share this info with wishlist viewers for gifting purposes only.
+                        </p>
+                      </div>
+                      <Switch
+                        checked={!!data.globalAddressConsent}
+                        onCheckedChange={(v) => setData((d) => ({ ...d, globalAddressConsent: !!v }))}
+                      />
+                    </div>
+
+                    <Separator />
+
+                    <AddressForm
+                      value={data.globalAddress}
+                      onChange={updateGlobalAddress}
+                      disabled={!data.globalAddressConsent}
+                    />
+                    {!data.globalAddressConsent && (
+                      <p className="text-xs text-muted-foreground">Enable consent to edit and share the address.</p>
+                    )}
+                  </div>
+                )}
+
+                {activeList && mode === "create" && (
+                  <div className="space-y-3">
+                    <Separator />
+                    <div className="flex items-center justify-between gap-3 rounded-2xl border p-3">
+                      <div>
+                        <div className="font-medium">Per-wishlist address</div>
+                        <div className="text-xs text-muted-foreground">Overrides global address for “{activeList.name}”.</div>
+                      </div>
+                      <Switch
+                        checked={!!activeList.addressEnabled}
+                        onCheckedChange={(v) =>
+                          setWishlistFlag(activeList.id, {
+                            addressEnabled: !!v,
+                            ...(v ? {} : { addressConsent: false }),
+                          })
+                        }
+                      />
+                    </div>
+
+                    {activeList.addressEnabled && (
+                      <div className="space-y-3 rounded-2xl border p-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <div className="font-medium">Consent</div>
+                            <p className="text-xs text-muted-foreground">
+                              By adding delivery details, you agree to share this info with wishlist viewers for gifting purposes only.
+                            </p>
+                          </div>
+                          <Switch
+                            checked={!!activeList.addressConsent}
+                            onCheckedChange={(v) => setWishlistFlag(activeList.id, { addressConsent: !!v })}
+                          />
+                        </div>
+                        <Separator />
+                        <AddressForm
+                          value={activeList.address}
+                          onChange={(patch) => updateWishlistAddress(activeList.id, patch)}
+                          disabled={!activeList.addressConsent}
+                        />
+                        {!activeList.addressConsent && (
+                          <p className="text-xs text-muted-foreground">Enable consent to edit and share the address.</p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* Main */}
+          <div className="lg:col-span-8">
+            {mode === "create" ? (
+              <CreatorPanel
+                activeList={activeList}
+                creatorHint={creatorHint}
+                itemLink={itemLink}
+                setItemLink={setItemLink}
+                itemTitle={itemTitle}
+                setItemTitle={setItemTitle}
+                itemDesc={itemDesc}
+                setItemDesc={setItemDesc}
+                itemPrice={itemPrice}
+                setItemPrice={setItemPrice}
+                itemImage={itemImage}
+                setItemImage={setItemImage}
+                addItem={addItem}
+                deleteWishlist={deleteWishlist}
+                deleteItem={deleteItem}
+              />
+            ) : (
+              <GifterPanel
+                wishlists={wishlists}
+                items={filteredItems}
+                selectedListId={selectedListId}
+                setSelectedListId={setSelectedListId}
+                priceMin={priceMin}
+                setPriceMin={setPriceMin}
+                priceMax={priceMax}
+                setPriceMax={setPriceMax}
+                sort={sort}
+                setSort={setSort}
+                favorites={data.favorites || {}}
+                toggleFavorite={toggleFavorite}
+                getAddressForWishlist={(wishlistId) => {
+                  const w = wishlists.find((x) => x.id === wishlistId);
+                  if (!w) return null;
+                  // If per-wishlist enabled + consent, use it
+                  if (w.addressEnabled && w.addressConsent) return w.address;
+                  // Else use global if enabled + consent
+                  if (data.globalAddressEnabled && data.globalAddressConsent) return data.globalAddress;
+                  return null;
+                }}
+                copyToClipboard={copyToClipboard}
+              />
+            )}
+          </div>
+        </div>
+
+        <footer className="mt-10 text-xs text-muted-foreground">
+          <p>
+            Disclaimer: Wish2Give provides wishlist organization and copyable delivery details only. Purchases are completed on the brand’s website.
+          </p>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function CreatorPanel({
+  activeList,
+  creatorHint,
+  itemLink,
+  setItemLink,
+  itemTitle,
+  setItemTitle,
+  itemDesc,
+  setItemDesc,
+  itemPrice,
+  setItemPrice,
+  itemImage,
+  setItemImage,
+  addItem,
+  deleteWishlist,
+  deleteItem,
+}) {
+  return (
+    <div className="space-y-4">
+      <Card className="rounded-2xl shadow-sm">
+        <CardHeader>
+          <CardTitle>Creator</CardTitle>
+          <CardDescription>Build your wishlist step by step ❤️</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {creatorHint}
+          <Separator />
+
+          {!activeList ? (
+            <div className="rounded-2xl border p-4">
+              <div className="font-medium">No wishlist selected</div>
+              <p className="text-sm text-muted-foreground mt-1">Create a wishlist on the left to start adding items.</p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm text-muted-foreground">Editing</div>
+                  <div className="text-xl font-semibold leading-tight">{activeList.name}</div>
+                  {activeList.theme ? (
+                    <div className="mt-1">
+                      <span className="text-xs text-muted-foreground">Theme: </span>
+                      <span className="text-xs font-medium">{activeList.theme}</span>
+                    </div>
+                  ) : null}
+                </div>
+                <Button
+                  variant="outline"
+                  className="rounded-2xl"
+                  onClick={() => deleteWishlist(activeList.id)}
+                >
+                  <Trash2 className="h-4 w-4 mr-2" /> Delete
+                </Button>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label>Product / service link 🔗</Label>
+                  <Input
+                    value={itemLink}
+                    onChange={(e) => setItemLink(e.target.value)}
+                    placeholder="https://..."
+                    className="rounded-2xl"
+                  />
+                  {itemLink && !isValidUrl(itemLink) && (
+                    <p className="text-xs text-red-600">Please paste a valid http(s) link.</p>
+                  )}
+                </div>
+                <div className="space-y-2">
+                  <Label>Image URL (optional)</Label>
+                  <Input
+                    value={itemImage}
+                    onChange={(e) => setItemImage(e.target.value)}
+                    placeholder="https://...jpg"
+                    className="rounded-2xl"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Title</Label>
+                  <Input
+                    value={itemTitle}
+                    onChange={(e) => setItemTitle(e.target.value)}
+                    placeholder="e.g., Cozy hoodie"
+                    className="rounded-2xl"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>Estimated price (optional)</Label>
+                  <Input
+                    inputMode="decimal"
+                    value={itemPrice}
+                    onChange={(e) => setItemPrice(e.target.value)}
+                    placeholder="e.g., 49.99"
+                    className="rounded-2xl"
+                  />
+                </div>
+                <div className="md:col-span-2 space-y-2">
+                  <Label>Description (optional)</Label>
+                  <Textarea
+                    value={itemDesc}
+                    onChange={(e) => setItemDesc(e.target.value)}
+                    placeholder="Color, size, model, notes..."
+                    className="rounded-2xl min-h-[88px]"
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <Button
+                  className="rounded-2xl"
+                  onClick={addItem}
+                  disabled={!isValidUrl(itemLink)}
+                >
+                  <Plus className="h-4 w-4 mr-2" /> Add item
+                </Button>
+                <p className="text-xs text-muted-foreground">
+                  Tip: For best results, fill in title + price.
+                </p>
+              </div>
+
+              <Separator />
+
+              {(activeList.items || []).length === 0 ? (
+                <div className="rounded-2xl border p-4">
+                  <div className="font-medium">No items yet</div>
+                  <p className="text-sm text-muted-foreground mt-1">Paste a link above to add your first item 🎁</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {(activeList.items || []).map((it) => (
+                    <ItemCard
+                      key={it.id}
+                      item={it}
+                      rightSlot={
+                        <Button
+                          variant="outline"
+                          className="rounded-2xl"
+                          onClick={() => deleteItem(activeList.id, it.id)}
+                        >
+                          <Trash2 className="h-4 w-4 mr-2" /> Remove
+                        </Button>
+                      }
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card className="rounded-2xl shadow-sm">
+        <CardHeader>
+          <CardTitle>Sharing</CardTitle>
+          <CardDescription>
+            MVP note: In a production app, you’d generate a shareable link per wishlist.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="rounded-2xl border p-4 text-sm">
+            <div className="flex items-center gap-2 font-medium">
+              <LinkIcon className="h-4 w-4" />
+              <span>Share (demo)</span>
+            </div>
+            <p className="text-muted-foreground mt-1">
+              For now, your lists are stored in this browser (localStorage). Export/share can be added later.
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function GifterPanel({
+  wishlists,
+  items,
+  selectedListId,
+  setSelectedListId,
+  priceMin,
+  setPriceMin,
+  priceMax,
+  setPriceMax,
+  sort,
+  setSort,
+  favorites,
+  toggleFavorite,
+  getAddressForWishlist,
+  copyToClipboard,
+}) {
+  const showAddress = selectedListId !== "all";
+  const addr = showAddress ? getAddressForWishlist(selectedListId) : null;
+  const addrText = addr ? formatAddress(addr) : "";
+
+  return (
+    <div className="space-y-4">
+      <Card className="rounded-2xl shadow-sm">
+        <CardHeader>
+          <CardTitle>Gifter</CardTitle>
+          <CardDescription>
+            Browse items, favorite ❤️ (doesn’t reserve), and buy on the original shop site.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+            <div className="space-y-2 md:col-span-2">
+              <Label>Wishlist</Label>
+              <Select value={selectedListId} onValueChange={setSelectedListId}>
+                <SelectTrigger className="rounded-2xl">
+                  <SelectValue placeholder="Select" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All wishlists</SelectItem>
+                  {wishlists.map((w) => (
+                    <SelectItem key={w.id} value={w.id}>
+                      {w.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label>Min price</Label>
+              <Input
+                inputMode="decimal"
+                value={priceMin}
+                onChange={(e) => setPriceMin(e.target.value)}
+                placeholder="0"
+                className="rounded-2xl"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>Max price</Label>
+              <Input
+                inputMode="decimal"
+                value={priceMax}
+                onChange={(e) => setPriceMax(e.target.value)}
+                placeholder="100"
+                className="rounded-2xl"
+              />
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center gap-2">
+              <Label className="text-sm">Sort</Label>
+              <Select value={sort} onValueChange={setSort}>
+                <SelectTrigger className="rounded-2xl w-[200px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">No sorting</SelectItem>
+                  <SelectItem value="low">Price: low → high</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Favorites don’t reserve or purchase items.
+            </p>
+          </div>
+
+          {showAddress && (
+            <div className="rounded-2xl border p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="font-medium">Delivery details</div>
+                  <p className="text-xs text-muted-foreground">
+                    Copy and paste this at checkout. If it’s empty, enter your own delivery details.
+                  </p>
+                </div>
+                <Button
+                  variant="outline"
+                  className="rounded-2xl"
+                  onClick={() => addrText && copyToClipboard(addrText)}
+                  disabled={!addrText}
+                >
+                  <Copy className="h-4 w-4 mr-2" /> Copy
+                </Button>
+              </div>
+              <pre className="mt-3 whitespace-pre-wrap text-sm bg-zinc-50 rounded-2xl p-3 border">
+                {addrText || "No address shared for this wishlist."}
+              </pre>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Purchases are completed on the brand’s website. Wish2Give only provides copyable information.
+              </p>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card className="rounded-2xl shadow-sm">
+        <CardHeader>
+          <CardTitle>Items</CardTitle>
+          <CardDescription>
+            {items.length ? `${items.length} item(s) shown` : "No matching items — try adjusting filters."}
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {items.length === 0 ? (
+            <div className="rounded-2xl border p-4">
+              <div className="font-medium">Nothing to show</div>
+              <p className="text-sm text-muted-foreground mt-1">If this is your own list, switch to “Create a wishlist” and add links.</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {items.map((it) => (
+                <ItemCard
+                  key={it.id}
+                  item={it}
+                  subtitle={
+                    <div className="text-xs text-muted-foreground">
+                      From <span className="font-medium">{it.wishlistName}</span>
+                      {it.wishlistTheme ? (
+                        <span className="ml-2 inline-flex align-middle">
+                          <Badge variant="secondary" className="rounded-xl">{it.wishlistTheme}</Badge>
+                        </span>
+                      ) : null}
+                    </div>
+                  }
+                  rightSlot={
+                    <div className="flex flex-col gap-2">
+                      <Button
+                        variant={favorites[it.id] ? "default" : "outline"}
+                        className="rounded-2xl"
+                        onClick={() => toggleFavorite(it.id)}
+                      >
+                        {favorites[it.id] ? (
+                          <>
+                            <Heart className="h-4 w-4 mr-2" /> Favorited
+                          </>
+                        ) : (
+                          <>
+                            <HeartOff className="h-4 w-4 mr-2" /> Favorite
+                          </>
+                        )}
+                      </Button>
+                      <Button
+                        className="rounded-2xl"
+                        asChild
+                      >
+                        <a href={it.link} target="_blank" rel="noreferrer">
+                          <Gift className="h-4 w-4 mr-2" /> Purchase
+                        </a>
+                      </Button>
+                    </div>
+                  }
+                />
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function ItemCard({ item, subtitle, rightSlot }) {
+  const host = safeHost(item.link);
+  return (
+    <Card className="rounded-2xl shadow-sm overflow-hidden">
+      <CardContent className="p-0">
+        <div className="grid grid-cols-1 sm:grid-cols-5">
+          <div className="sm:col-span-2 bg-zinc-50 border-b sm:border-b-0 sm:border-r">
+            {item.image ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={item.image}
+                alt={item.title}
+                className="h-48 sm:h-full w-full object-cover"
+                onError={(e) => {
+                  e.currentTarget.style.display = "none";
+                }}
+              />
+            ) : (
+              <div className="h-48 sm:h-full w-full grid place-items-center text-muted-foreground">
+                <div className="text-center">
+                  <div className="text-sm">No image</div>
+                  <div className="text-xs">(optional)</div>
+                </div>
+              </div>
+            )}
+          </div>
+          <div className="sm:col-span-3 p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="font-semibold leading-tight line-clamp-2">{item.title}</div>
+                {subtitle ? <div className="mt-1">{subtitle}</div> : null}
+                <div className="mt-2 text-sm text-muted-foreground line-clamp-3">{item.description || "No description."}</div>
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  {item.price !== null && item.price !== undefined ? (
+                    <Badge className="rounded-xl">{currency(item.price)}</Badge>
+                  ) : (
+                    <Badge variant="secondary" className="rounded-xl">Price not set</Badge>
+                  )}
+                  {host ? (
+                    <Badge variant="outline" className="rounded-xl">{host}</Badge>
+                  ) : null}
+                </div>
+              </div>
+              <div className="shrink-0">{rightSlot}</div>
+            </div>
+
+            <div className="mt-3">
+              <Button
+                variant="link"
+                className="px-0 h-auto"
+                asChild
+              >
+                <a href={item.link} target="_blank" rel="noreferrer">
+                  <LinkIcon className="h-4 w-4 mr-2" /> Open product link
+                </a>
+              </Button>
+              <p className="text-xs text-muted-foreground">
+                Purchases happen on the shop’s website — Wish2Give doesn’t sell products.
+              </p>
+            </div>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function AddressForm({ value, onChange, disabled }) {
+  return (
+    <div className={`grid grid-cols-1 md:grid-cols-2 gap-3 ${disabled ? "opacity-60" : ""}`}>
+      <div className="space-y-2 md:col-span-2">
+        <Label>Full name</Label>
+        <Input
+          value={value.fullName}
+          onChange={(e) => onChange({ fullName: e.target.value })}
+          placeholder="Full name"
+          className="rounded-2xl"
+          disabled={disabled}
+        />
+      </div>
+      <div className="space-y-2 md:col-span-2">
+        <Label>Street address</Label>
+        <Input
+          value={value.street}
+          onChange={(e) => onChange({ street: e.target.value })}
+          placeholder="Street and number"
+          className="rounded-2xl"
+          disabled={disabled}
+        />
+      </div>
+      <div className="space-y-2">
+        <Label>City</Label>
+        <Input
+          value={value.city}
+          onChange={(e) => onChange({ city: e.target.value })}
+          placeholder="City"
+          className="rounded-2xl"
+          disabled={disabled}
+        />
+      </div>
+      <div className="space-y-2">
+        <Label>ZIP / Postal code</Label>
+        <Input
+          value={value.postalCode}
+          onChange={(e) => onChange({ postalCode: e.target.value })}
+          placeholder="Postal code"
+          className="rounded-2xl"
+          disabled={disabled}
+        />
+      </div>
+      <div className="space-y-2">
+        <Label>Country</Label>
+        <Input
+          value={value.country}
+          onChange={(e) => onChange({ country: e.target.value })}
+          placeholder="Country"
+          className="rounded-2xl"
+          disabled={disabled}
+        />
+      </div>
+      <div className="space-y-2">
+        <Label>Phone (optional)</Label>
+        <Input
+          value={value.phone}
+          onChange={(e) => onChange({ phone: e.target.value })}
+          placeholder="+32 ..."
+          className="rounded-2xl"
+          disabled={disabled}
+        />
+      </div>
+    </div>
+  );
+}
